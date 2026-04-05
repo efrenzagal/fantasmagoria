@@ -23,12 +23,17 @@
   source("fantasmagoria_functions.R")
 }
 
-# Load & prepare data (runs once at startup)
+# Load & prepare data helper
 {
-  summaries_df <- load_summaries() %>%
-    add_scores() %>%
-    add_dynamic_scores() %>%
-    arrange(desc(start_time))
+  reload_summaries <- function() {
+    load_summaries() %>%
+      add_scores() %>%
+      add_dynamic_scores() %>%
+      arrange(desc(start_time))
+  }
+  
+  # Initial load (used for UI dropdowns that need data at build time)
+  summaries_df_init <- reload_summaries()
 }
 
 
@@ -58,6 +63,7 @@ ui <- {
         menuItem("Trend Plot",  tabName = "trend",     icon = icon("chart-line")),
         menuItem("New Race",    tabName = "new_race",  icon = icon("person-running")),
         menuItem("Deep Dive",   tabName = "deep_dive", icon = icon("magnifying-glass")),
+        menuItem("Shoes",       tabName = "shoes",      icon = icon("shoe-prints")),
         menuItem("Update Data", tabName = "update",    icon = icon("rotate"))
       )
     ),
@@ -199,12 +205,12 @@ ui <- {
                   box(title = "Select race", width = 3, solidHeader = TRUE,
                       selectInput("dd_id", "Race:",
                                   choices  = setNames(
-                                    summaries_df$id,
-                                    paste(format(summaries_df$start_time, "%Y-%m-%d"),
-                                          round(summaries_df$distance_total, 1), "km |",
-                                          sapply(summaries_df$pace_mean, pace_dec_to_str), "min/km")
+                                    summaries_df_init$id,
+                                    paste(format(summaries_df_init$start_time, "%Y-%m-%d"),
+                                          round(summaries_df_init$distance_total, 1), "km |",
+                                          sapply(summaries_df_init$pace_mean, pace_dec_to_str), "min/km")
                                   ),
-                                  selected = summaries_df$id[1]),
+                                  selected = summaries_df_init$id[1]),
                       uiOutput("dd_summary_table")
                   ),
                   
@@ -225,7 +231,29 @@ ui <- {
         ),
         
         # ====================================================
-        # TAB 4: UPDATE DATA
+        # TAB 5: SHOES ANALYSIS
+        # ====================================================
+        tabItem(tabName = "shoes",
+                fluidRow(
+                  box(title = "Shoe Dictionary", width = 12, solidHeader = TRUE,
+                      p("Edit shoe names below. Shoe IDs from Nike are mapped to friendly names."),
+                      uiOutput("shoes_dict_ui")
+                  )
+                ),
+                fluidRow(
+                  box(title = "Mileage by Shoe", width = 12, solidHeader = TRUE,
+                      plotlyOutput("shoes_bar_plot", height = "300px")
+                  )
+                ),
+                fluidRow(
+                  box(title = "Shoe Scorecards", width = 12, solidHeader = TRUE,
+                      uiOutput("shoes_scorecards")
+                  )
+                )
+        ),
+        
+        # ====================================================
+        # TAB 6: UPDATE DATA
         # ====================================================
         tabItem(tabName = "update",
                 fluidRow(
@@ -264,11 +292,14 @@ ui <- {
 # ============================================================
 server <- function(input, output, session) {
   
+  # Reactive data store — updated when new data is fetched
+  summaries_df <- reactiveVal(summaries_df_init)
+  
   # ---- TREND PLOT ------------------------------------------
   {
     output$trend_plot <- renderPlotly({
       p <- create_trend_plot(
-        df          = summaries_df,
+        df          = summaries_df(),
         start_date  = input$trend_start,
         end_date    = input$trend_end,
         period      = input$trend_period,
@@ -292,7 +323,7 @@ server <- function(input, output, session) {
         ascent            = input$nr_ascent,
         descent           = input$nr_descent,
         net_ascent_per_km = (input$nr_ascent - input$nr_descent) / input$nr_distance,
-        score             = score_new_race(input$nr_distance, pace_dec, summaries_df)
+        score             = score_new_race(input$nr_distance, pace_dec, summaries_df())
       )
     })
     
@@ -304,14 +335,14 @@ server <- function(input, output, session) {
     
     output$nr_pct_dist_box <- renderInfoBox({
       nr  <- new_race()
-      pct <- round(100 * ecdf(summaries_df$distance_total)(nr$distance), 1)
+      pct <- round(100 * ecdf(summaries_df()$distance_total)(nr$distance), 1)
       infoBox("Distance percentile", paste0(pct, "th"),
               icon = icon("ruler"), color = "blue", fill = TRUE)
     })
     
     output$nr_pct_pace_box <- renderInfoBox({
       nr  <- new_race()
-      pct <- round(100 * (1 - ecdf(summaries_df$pace_mean)(nr$pace_dec)), 1)
+      pct <- round(100 * (1 - ecdf(summaries_df()$pace_mean)(nr$pace_dec)), 1)
       infoBox("Pace percentile", paste0(pct, "th"),
               icon = icon("bolt"), color = "green", fill = TRUE)
     })
@@ -319,7 +350,7 @@ server <- function(input, output, session) {
     # Similar race styled card
     output$nr_similar_card <- renderUI({
       nr      <- new_race()
-      similar <- find_similar_race(nr$distance, nr$pace_dec, nr$net_ascent_per_km, summaries_df)
+      similar <- find_similar_race(nr$distance, nr$pace_dec, nr$net_ascent_per_km, summaries_df())
       s       <- similar[1, ]
       
       score_color <- if (s$score >= 75) "#00cc44"
@@ -368,7 +399,7 @@ server <- function(input, output, session) {
       nr <- new_race()
       plot_ly() %>%
         add_trace(
-          type = "violin", y = summaries_df$distance_total,
+          type = "violin", y = summaries_df()$distance_total,
           name = "History",
           box = list(visible = TRUE),
           meanline = list(visible = TRUE),
@@ -395,7 +426,7 @@ server <- function(input, output, session) {
       nr <- new_race()
       plot_ly() %>%
         add_trace(
-          type = "violin", y = summaries_df$pace_mean,
+          type = "violin", y = summaries_df()$pace_mean,
           name = "History",
           box = list(visible = TRUE),
           meanline = list(visible = TRUE),
@@ -417,16 +448,24 @@ server <- function(input, output, session) {
         apply_dark_theme()
     })
     
-    # Scatterplot
+    # Scatterplot with efficiency frontier
     output$nr_scatter_plot <- renderPlotly({
-      nr <- new_race()
-      p  <- summaries_df %>%
+      nr       <- new_race()
+      frontier <- compute_efficiency_frontier(summaries_df())
+      
+      p <- summaries_df() %>%
         ggplot(aes(x = distance_total, y = pace_mean, color = score,
                    text = paste0(format(start_time, "%Y-%m-%d"),
                                  "<br>", round(distance_total, 1), " km | ",
                                  sapply(pace_mean, pace_dec_to_str),
                                  "<br>Score: ", round(score, 1)))) +
         geom_point(alpha = 0.8, size = 2.5) +
+        geom_line(data = frontier, aes(x = distance_total, y = pace_mean),
+                  color = "#00cc44", linewidth = 0.8, linetype = "dashed",
+                  alpha = 0.7, inherit.aes = FALSE) +
+        geom_point(data = frontier, aes(x = distance_total, y = pace_mean),
+                   color = "#00cc44", size = 2, shape = 16,
+                   alpha = 0.5, inherit.aes = FALSE) +
         geom_point(aes(x = nr$distance, y = nr$pace_dec),
                    color = "#ff6b6b", size = 8, shape = 18, inherit.aes = FALSE) +
         scale_color_gradient2(low = "#ff4444", mid = "#ffdd00",
@@ -441,7 +480,7 @@ server <- function(input, output, session) {
   {
     # Summary as a styled card (no table — avoids white row issue)
     output$dd_summary_table <- renderUI({
-      df <- summaries_df %>% filter(id == input$dd_id)
+      df <- summaries_df() %>% filter(id == input$dd_id)
       if (nrow(df) == 0) return(NULL)
       
       score_color <- if (df$score[1] >= 75) "#00cc44"
@@ -461,13 +500,15 @@ server <- function(input, output, session) {
     })
     
     output$dd_pace_plot <- renderPlotly({
-      avg_pace <- summaries_df %>% filter(id == input$dd_id) %>% pull(pace_mean)
+      avg_pace <- summaries_df() %>% filter(id == input$dd_id) %>% pull(pace_mean)
       if (input$dd_pace_view == "continuous") {
-        p <- plot_pace_continuous(input$dd_id, avg_pace = avg_pace)
+        # plot_pace_continuous returns native plotly — just apply theme
+        plot_pace_continuous(input$dd_id, avg_pace = avg_pace) %>%
+          apply_dark_theme()
       } else {
         p <- plot_pace_by_km(input$dd_id, avg_pace = avg_pace)
+        ggplotly(p, tooltip = "text") %>% apply_dark_theme()
       }
-      ggplotly(p, tooltip = "text") %>% apply_dark_theme()
     })
     
     output$dd_elevation_plot <- renderPlotly({
@@ -487,17 +528,31 @@ server <- function(input, output, session) {
       
       pal <- leaflet::colorNumeric("RdYlGn", domain = gps$minute, reverse = TRUE)
       
+      # Build hover labels with km, pace, and elapsed time
+      hover_labels <- paste0(
+        "<b>Km:</b> ", round(gps$cum_distance, 2),
+        " | <b>Pace:</b> ", gps$pace_str,
+        " | <b>Min:</b> ", round(gps$minute, 1)
+      )
+      
       leaflet::leaflet(gps) %>%
         leaflet::addProviderTiles(leaflet::providers$CartoDB.DarkMatter) %>%
         leaflet::addCircles(
           lng         = ~longitude, lat = ~latitude,
           radius      = 8, color = ~pal(minute),
           stroke      = FALSE, fillOpacity = 0.9,
-          popup       = ~paste0("Min: ", round(minute, 1))
+          label       = lapply(hover_labels, shiny::HTML),
+          popup       = lapply(hover_labels, shiny::HTML)
         ) %>%
         leaflet::addPolylines(
           lng     = ~longitude, lat = ~latitude,
           color   = "#00d4ff", weight = 2, opacity = 0.6
+        ) %>%
+        leaflet::addLegend(
+          position = "bottomright", pal = pal, values = ~minute,
+          title    = "Elapsed time",
+          labFormat = leaflet::labelFormat(suffix = " min"),
+          opacity  = 0.9
         )
     })
   }
@@ -505,25 +560,154 @@ server <- function(input, output, session) {
   # ---- UPDATE DATA -----------------------------------------
   {
     output$update_total_runs <- renderInfoBox({
-      infoBox("Total runs", nrow(summaries_df),
+      infoBox("Total runs", nrow(summaries_df()),
               icon = icon("person-running"), color = "blue", fill = TRUE)
     })
     
     output$update_latest_run <- renderInfoBox({
-      infoBox("Latest run", format(max(summaries_df$start_time), "%Y-%m-%d"),
+      infoBox("Latest run", format(max(summaries_df()$start_time), "%Y-%m-%d"),
               icon = icon("calendar-check"), color = "green", fill = TRUE)
     })
     
     output$update_earliest_run <- renderInfoBox({
-      infoBox("First run", format(min(summaries_df$start_time), "%Y-%m-%d"),
+      infoBox("First run", format(min(summaries_df()$start_time), "%Y-%m-%d"),
               icon = icon("calendar"), color = "yellow", fill = TRUE)
     })
     
     observeEvent(input$update_go, {
       req(input$update_token)
-      output$update_log <- renderText({
-        "Paste your token into nike_run_club_export.R and run it, then restart this app to reload updated data."
+      
+      # Collect log messages
+      log_messages <- reactiveVal("")
+      log_fn <- function(msg) {
+        log_messages(paste0(log_messages(), msg, "\n"))
+      }
+      
+      tryCatch({
+        log_fn("Starting incremental update...")
+        n_new <- fetch_new_activities(
+          token        = input$update_token,
+          output_dir   = BASE_DIR,
+          existing_ids = summaries_df()$id,
+          log_fn       = log_fn
+        )
+        
+        if (!is.null(n_new) && n_new > 0) {
+          log_fn("Reloading data...")
+          summaries_df(reload_summaries())
+          
+          # Update the deep dive dropdown
+          new_df <- summaries_df()
+          updateSelectInput(session, "dd_id",
+                            choices  = setNames(
+                              new_df$id,
+                              paste(format(new_df$start_time, "%Y-%m-%d"),
+                                    round(new_df$distance_total, 1), "km |",
+                                    sapply(new_df$pace_mean, pace_dec_to_str), "min/km")
+                            ),
+                            selected = new_df$id[1]
+          )
+          log_fn("Dashboard updated successfully!")
+        }
+      }, error = function(e) {
+        log_fn(paste0("ERROR: ", e$message))
       })
+      
+      output$update_log <- renderText({ log_messages() })
+    })
+  }
+  
+  # ---- SHOES ANALYSIS ---------------------------------------
+  {
+    # Load shoe data once (cached)
+    shoe_data <- reactive({
+      summaries_df()  # trigger reactivity on data refresh
+      shoe_df <- load_shoe_data()
+      compute_shoe_stats(summaries_df(), shoe_df)
+    })
+    
+    # Shoe dictionary display
+    output$shoes_dict_ui <- renderUI({
+      stats <- shoe_data()
+      if (nrow(stats) == 0) return(p("No shoe data found."))
+      
+      shoe_ids <- stats$shoe_id[stats$shoe_id != "Unassigned"]
+      if (length(shoe_ids) == 0) return(p("No shoes with IDs found in your data."))
+      
+      tags$div(
+        style = "display:flex; flex-wrap:wrap; gap:12px;",
+        lapply(shoe_ids, function(sid) {
+          tags$div(
+            style = "background:#1a1a1a; padding:8px 14px; border-radius:6px; border-left:3px solid #00d4ff;",
+            tags$span(style = "color:#aaa; font-size:10px;", "ID: "),
+            tags$span(style = "color:#f0f0f0; font-size:12px; font-family:monospace;",
+                      substr(sid, 1, 12)),
+            tags$span(style = "color:#aaa; font-size:10px;", "...")
+          )
+        })
+      )
+    })
+    
+    # Mileage bar chart
+    output$shoes_bar_plot <- renderPlotly({
+      stats <- shoe_data()
+      if (nrow(stats) == 0) return(plot_ly() %>% apply_dark_theme())
+      
+      stats <- stats %>% arrange(total_km)
+      stats$shoe_label <- ifelse(
+        stats$shoe_id == "Unassigned", "Unassigned",
+        paste0("Shoe ", seq_len(nrow(stats)))
+      )
+      stats$shoe_label <- factor(stats$shoe_label, levels = stats$shoe_label)
+      
+      plot_ly(stats, x = ~total_km, y = ~shoe_label, type = "bar",
+              orientation = "h",
+              marker = list(color = COL_ACCENT),
+              hoverinfo = "text",
+              text = ~paste0(shoe_label, "<br>", total_km, " km<br>",
+                             n_races, " races")) %>%
+        layout(
+          xaxis = list(title = "Total Kilometers"),
+          yaxis = list(title = ""),
+          margin = list(l = 100)
+        ) %>%
+        apply_dark_theme()
+    })
+    
+    # Scorecards for each shoe
+    output$shoes_scorecards <- renderUI({
+      stats <- shoe_data()
+      if (nrow(stats) == 0) return(p("No shoe data available."))
+      
+      cards <- lapply(seq_len(nrow(stats)), function(i) {
+        s <- stats[i, ]
+        shoe_label <- if (s$shoe_id == "Unassigned") "Unassigned" else paste0("Shoe ", i)
+        
+        tags$div(
+          style = "background:#2b2b2b; border-radius:8px; padding:16px; margin-bottom:16px;
+                   border-left:4px solid #00d4ff;",
+          tags$h4(style = "color:#00d4ff; margin-top:0;", shoe_label),
+          tags$div(
+            style = "display:flex; flex-wrap:wrap; gap:12px;",
+            tags$div(style = "display:flex; flex-wrap:wrap; gap:8px; width:100%;",
+                     dd_stat("Total km",      paste0(s$total_km, " km"),              "#00d4ff"),
+                     dd_stat("Races",         s$n_races,                              "#f0f0f0"),
+                     dd_stat("Avg pace",      pace_dec_to_str(s$avg_pace),            "#00d4ff"),
+                     dd_stat("Best pace",     pace_dec_to_str(s$best_pace),           "#00cc44"),
+                     dd_stat("Worst pace",    pace_dec_to_str(s$worst_pace),          "#ff4444"),
+                     dd_stat("Avg distance",  paste0(s$avg_distance, " km"),          "#f0f0f0"),
+                     dd_stat("Min distance",  paste0(s$min_distance, " km"),          "#f0f0f0"),
+                     dd_stat("Max distance",  paste0(s$max_distance, " km"),          "#f0f0f0"),
+                     dd_stat("Dist %ile",     paste0(s$dist_pct, "th"),               "#ffaa00"),
+                     dd_stat("Pace %ile",     paste0(s$pace_pct, "th"),               "#ffaa00"),
+                     dd_stat("First used",    format(s$first_used, "%Y-%m-%d"),       "#aaa"),
+                     dd_stat("Last used",     format(s$last_used, "%Y-%m-%d"),        "#aaa")
+            )
+          )
+        )
+      })
+      
+      do.call(tagList, cards)
     })
   }
   
