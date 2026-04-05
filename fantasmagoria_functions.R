@@ -193,78 +193,125 @@
   # Extract km splits (moments) from a detail JSON
   # Uses speed time-series to subtract pause time (traffic lights, shoe tying)
   extract_detail_splits <- function(activity_id) {
-    # Load moments and time-series data
+    # Load moments
     {
       result  <- load_detail(activity_id)
       moments <- result$moments
       if (is.null(moments) || !is.data.frame(moments) || nrow(moments) == 0) return(NULL)
     }
     
-    # Build splits with active-only pace (excluding pauses)
+    # Build splits with proper POSIXct timestamps from the start
     {
       splits <- moments %>%
         filter(key == "split_km") %>%
         mutate(
-          id        = activity_id,
-          km        = as.numeric(value),
-          timestamp = as.POSIXct(timestamp / 1000, origin = "1970-01-01", tz = "UTC") %>%
-            with_tz(TZ)
+          id              = activity_id,
+          km              = as.numeric(value),
+          timestamp_posix = as.POSIXct(timestamp / 1000,
+                                       origin = "1970-01-01", tz = "UTC") %>%
+            with_tz(TZ),
+          timestamp_ms    = as.numeric(timestamp)
         ) %>%
         arrange(km)
       
-      run_start <- as.POSIXct(result$start_epoch_ms / 1000,
-                              origin = "1970-01-01", tz = "UTC") %>% with_tz(TZ)
+      run_start_posix <- as.POSIXct(result$start_epoch_ms / 1000,
+                                    origin = "1970-01-01", tz = "UTC") %>%
+        with_tz(TZ)
+      run_start_ms <- as.numeric(result$start_epoch_ms)
       
-      # Try to get speed time-series to detect pauses
-      ts <- tryCatch(extract_detail_timeseries(activity_id), error = function(e) NULL)
+      splits$prev_time_posix <- c(run_start_posix,
+                                  splits$timestamp_posix[-nrow(splits)])
+      splits$prev_time_ms    <- c(run_start_ms,
+                                  splits$timestamp_ms[-nrow(splits)])
+    }
+    
+    # Compute active duration per split using speed point samples
+    {
+      ts       <- tryCatch(extract_detail_timeseries(activity_id), error = function(e) NULL)
       speed_ts <- NULL
+      
       if (!is.null(ts)) {
         speed_ts <- ts %>%
           filter(variable == "speed") %>%
           arrange(start_epoch_ms) %>%
-          select(start_epoch_ms, end_epoch_ms, speed = value)
+          select(start_epoch_ms, speed = value)
       }
       
-      splits$prev_time <- c(run_start, splits$timestamp[-nrow(splits)])
+      # Speed is in m/s — 0.5 m/s (~1.8 km/h) as stopped threshold
+      PAUSE_THRESHOLD_MS <- 0.5
       
       if (!is.null(speed_ts) && nrow(speed_ts) > 2) {
-        # For each split, sum only the time segments where speed > 0
-        PAUSE_THRESHOLD <- 0.5  # m/s — below this counts as paused
+        # Compute median interval between samples (in seconds)
+        sample_interval_s <- median(diff(speed_ts$start_epoch_ms), na.rm = TRUE) / 1000
+        if (is.na(sample_interval_s) || sample_interval_s <= 0) sample_interval_s <- 1
+        
         active_durations <- numeric(nrow(splits))
         
         for (i in seq_len(nrow(splits))) {
-          split_start_ms <- as.numeric(splits$prev_time[i]) * 1000
-          split_end_ms   <- as.numeric(splits$timestamp[i]) * 1000
-          
           segs <- speed_ts %>%
-            filter(start_epoch_ms >= split_start_ms,
-                   start_epoch_ms <= split_end_ms)
+            filter(start_epoch_ms >= splits$prev_time_ms[i],
+                   start_epoch_ms <= splits$timestamp_ms[i])
           
           if (nrow(segs) > 0) {
-            # Each segment duration where runner was moving
-            segs <- segs %>%
-              mutate(seg_duration = (end_epoch_ms - start_epoch_ms) / 1000) %>%
-              filter(speed >= PAUSE_THRESHOLD)
-            active_durations[i] <- sum(segs$seg_duration, na.rm = TRUE)
+            # Count samples where runner was moving, multiply by sample interval
+            n_active <- sum(segs$speed >= PAUSE_THRESHOLD_MS, na.rm = TRUE)
+            active_durations[i] <- n_active * sample_interval_s
           } else {
-            # Fallback to wall-clock time
-            active_durations[i] <- as.numeric(difftime(splits$timestamp[i],
-                                                       splits$prev_time[i], units = "secs"))
+            # Fallback: wall-clock time
+            active_durations[i] <- as.numeric(
+              difftime(splits$timestamp_posix[i],
+                       splits$prev_time_posix[i], units = "secs")
+            )
           }
         }
         
         splits$split_duration_s <- active_durations
+        
       } else {
-        # Fallback: use wall-clock time if no speed data
-        splits$split_duration_s <- as.numeric(difftime(splits$timestamp,
-                                                       splits$prev_time, units = "secs"))
+        # No speed data at all — use wall-clock time
+        splits$split_duration_s <- as.numeric(
+          difftime(splits$timestamp_posix, splits$prev_time_posix, units = "secs")
+        )
       }
       
+      # split_pace in min/km (duration_s / 60 gives minutes for exactly 1 km)
       splits$split_pace <- splits$split_duration_s / 60
-      splits <- splits %>% select(id, km, timestamp, split_duration_s, split_pace)
     }
     
-    return(splits)
+    splits %>%
+      select(id, km, timestamp = timestamp_posix, split_duration_s, split_pace)
+  }
+  
+  # Load ML models  
+  load_ml_models <- function() {
+    {
+      model_dir <- BASE_DIR
+      
+      paths <- list(
+        lm      = file.path(model_dir, "model_lm.rds"),
+        xgb     = file.path(model_dir, "model_xgb.rds"),
+        ml_df   = file.path(model_dir, "ml_df.rds"),
+        ml_mat  = file.path(model_dir, "ml_matrix.rds"),
+        terrain = file.path(model_dir, "terrain_lookup.rds"),
+        feats   = file.path(model_dir, "feature_cols.rds")
+      )
+      
+      missing <- names(paths)[!sapply(paths, file.exists)]
+      if (length(missing) > 0) {
+        warning("ML models not found: ", paste(missing, collapse = ", "),
+                "\nRun ml_lab.R first to train and save models.")
+        return(NULL)
+      }
+      
+      list(
+        lm      = readRDS(paths$lm),
+        xgb     = readRDS(paths$xgb),
+        ml_df   = readRDS(paths$ml_df),
+        ml_mat  = readRDS(paths$ml_mat),
+        terrain = readRDS(paths$terrain),
+        feats   = readRDS(paths$feats)
+      )
+    }
   }
 }
 
@@ -347,15 +394,20 @@
   
   # Compute efficiency frontier: best pace at each distance level (Pareto optimal)
   compute_efficiency_frontier <- function(df) {
-    {
-      frontier <- df %>%
-        arrange(distance_total) %>%
-        mutate(running_min_pace = cummin(pace_mean)) %>%
-        filter(pace_mean == running_min_pace) %>%
-        select(distance_total, pace_mean, score, start_time)
-    }
-    return(frontier)
+    breaks <- c(0, 3, 5, 7, 10, 15, 21.1, 30, 42.2, Inf)
+    labels <- c("<3km", "3-5km", "5-7km", "7-10km",
+                "10-15km", "15-21km", "21-30km", "30-42km", "42km+")
+    
+    df %>%
+      filter(!is.na(distance_total), !is.na(pace_mean)) %>%
+      mutate(dist_bin = cut(distance_total, breaks = breaks, labels = labels)) %>%
+      group_by(dist_bin) %>%
+      slice_min(pace_mean, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      arrange(distance_total) %>%
+      select(distance_total, pace_mean, score, start_time)
   }
+  
   
   find_similar_race <- function(distance, pace_dec, net_ascent_per_km, all_races_df, k = 1) {
     {
@@ -453,19 +505,27 @@
     }
     
     {
-      p <- splits %>%
+      splits_clean <- splits %>%
         filter(!is.na(split_pace), split_pace > 0, split_pace < 20) %>%
+        mutate(pace_str = sapply(split_pace, pace_dec_to_str))
+      
+      if (nrow(splits_clean) == 0) {
+        return(ggplot() +
+                 labs(title = "No valid split paces (all filtered out)") +
+                 theme_fantasmagoria())
+      }
+      
+      p <- splits_clean %>%
         ggplot(aes(x = km, y = split_pace,
-                   text = paste0("Km: ", km,
-                                 "<br>Pace: ", sapply(split_pace, pace_dec_to_str)))) +
-        geom_line(color  = "#00d4ff", linewidth = 1) +
-        geom_point(color = "#00d4ff", size = 2.5) +
+                   text = paste0("Km: ", km, "<br>Pace: ", pace_str))) +
+        geom_line(color  = COL_ACCENT, linewidth = 1) +
+        geom_point(color = COL_ACCENT, size = 2.5) +
         xlab("Km") +
         ylab("Pace (min/km)") +
         theme_fantasmagoria()
       
       if (!is.null(avg_pace)) {
-        p <- p + geom_hline(yintercept = avg_pace, color = "#ff6b6b",
+        p <- p + geom_hline(yintercept = avg_pace, color = COL_TREND,
                             linetype = "dashed", linewidth = 0.8)
       }
     }
@@ -726,7 +786,7 @@
                                    log_fn = message) {
     {
       dir.create(output_dir, showWarnings = FALSE)
-      all_new <- data.frame()
+      all_new  <- data.frame()
       next_url <- paste0(
         "https://api.nike.com/plus/v3/activities/before_id/v3/*",
         "?limit=30&types=run,jogging&include_deleted=false"
@@ -743,13 +803,10 @@
         activities <- data$activities
         if (is.null(activities) || nrow(activities) == 0) break
         
-        # Check which are genuinely new
         new_acts <- activities %>% filter(!id %in% existing_ids)
         if (nrow(new_acts) == 0) break
         
         all_new <- bind_rows(all_new, new_acts)
-        
-        # If some were already known, we've reached the overlap
         if (nrow(new_acts) < nrow(activities)) break
         
         before_id <- data$paging$before_id
@@ -764,7 +821,7 @@
       }
     }
     
-    # Flatten and save
+    # Flatten and save summary CSV
     {
       if (nrow(all_new) == 0) {
         log_fn("No new activities found.")
@@ -774,16 +831,15 @@
       log_fn(paste0("Found ", nrow(all_new), " new activities. Flattening metrics..."))
       metrics_df <- bind_rows(lapply(all_new$summaries, flatten_activity_metrics))
       
-      new_summary <- all_new |>
-        select(id, type, start_epoch_ms, end_epoch_ms, active_duration_ms, status) |>
-        bind_cols(metrics_df) |>
+      new_summary <- all_new %>%
+        select(id, type, start_epoch_ms, end_epoch_ms, active_duration_ms, status) %>%
+        bind_cols(metrics_df) %>%
         mutate(
           start_time   = as.POSIXct(start_epoch_ms / 1000, origin = "1970-01-01", tz = "UTC"),
           end_time     = as.POSIXct(end_epoch_ms   / 1000, origin = "1970-01-01", tz = "UTC"),
           duration_min = active_duration_ms / 60000
         )
       
-      # Append to existing CSV
       csv_path <- file.path(output_dir, "activity_summaries.csv")
       if (file.exists(csv_path)) {
         existing <- fread(csv_path) %>% as.data.frame()
@@ -795,25 +851,57 @@
       log_fn(paste0("Updated CSV: ", csv_path, " (", nrow(combined), " total)"))
     }
     
-    # Download detail JSONs for new activities
+    # Download detail JSONs + update shoe_index.csv incrementally
     {
-      detail_dir <- file.path(output_dir, "activity_details")
+      detail_dir  <- file.path(output_dir, "activity_details")
+      index_path  <- file.path(output_dir, "shoe_index.csv")
       dir.create(detail_dir, showWarnings = FALSE)
+      
+      new_shoe_rows <- list()
       
       for (i in seq_along(all_new$id)) {
         aid      <- all_new$id[i]
         out_file <- file.path(detail_dir, paste0(aid, ".json"))
+        
         if (file.exists(out_file)) next
         
         log_fn(paste0("  Downloading detail [", i, "/", length(all_new$id), "] ", aid))
+        
         tryCatch({
-          detail_url <- paste0("https://api.nike.com/sport/v3/me/activity/", aid, "?metrics=ALL")
+          detail_url <- paste0("https://api.nike.com/sport/v3/me/activity/",
+                               aid, "?metrics=ALL")
           detail     <- nike_api_get(detail_url, token)
           write_json(detail, out_file, pretty = TRUE, auto_unbox = TRUE)
+          
+          # Extract shoe_id for index
+          tags    <- detail$tags
+          shoe_id <- if (is.data.frame(tags)) tags[["shoe_id"]] %||% NA_character_
+          else                     tags[["shoe_id"]] %||% NA_character_
+          new_shoe_rows[[length(new_shoe_rows) + 1]] <- data.frame(
+            id      = aid,
+            shoe_id = shoe_id,
+            stringsAsFactors = FALSE
+          )
         }, error = function(e) {
           log_fn(paste0("    WARNING: failed for ", aid, ": ", e$message))
         })
+        
         Sys.sleep(0.3)
+      }
+      
+      # Append new shoe rows to index
+      if (length(new_shoe_rows) > 0) {
+        new_index_rows <- bind_rows(new_shoe_rows)
+        
+        if (file.exists(index_path)) {
+          existing_index <- fread(index_path) %>% as.data.frame()
+          updated_index  <- bind_rows(existing_index, new_index_rows)
+        } else {
+          updated_index <- new_index_rows
+        }
+        
+        write.csv(updated_index, index_path, row.names = FALSE)
+        log_fn(paste0("shoe_index.csv updated (", nrow(updated_index), " total rows)"))
       }
     }
     
@@ -829,27 +917,20 @@
 {
   # Load shoe_id for all activities from detail JSONs
   load_shoe_data <- function() {
-    {
-      json_files <- list.files(DETAIL_DIR, pattern = "\\.json$", full.names = TRUE)
-      if (length(json_files) == 0) return(data.frame(id = character(0), shoe_id = character(0)))
+    index_path <- file.path(BASE_DIR, "shoe_index.csv")
+    
+    if (!file.exists(index_path)) {
+      # Index not built yet — warn clearly rather than silently hanging
+      warning(
+        "shoe_index.csv not found at: ", index_path, "\n",
+        "Run build_shoe_index.R once to generate it."
+      )
+      return(data.frame(id = character(0), shoe_id = character(0)))
     }
     
-    {
-      shoe_list <- lapply(json_files, function(f) {
-        tryCatch({
-          result <- fromJSON(f, simplifyVector = TRUE)
-          tags   <- result$tags
-          data.frame(
-            id      = result$id %||% NA_character_,
-            shoe_id = tags[["shoe_id"]] %||% NA_character_,
-            stringsAsFactors = FALSE
-          )
-        }, error = function(e) NULL)
-      })
-      shoe_df <- bind_rows(shoe_list)
-    }
-    
-    return(shoe_df)
+    fread(index_path) %>%
+      as.data.frame() %>%
+      mutate(shoe_id = as.character(shoe_id))
   }
   
   # Compute shoe summary statistics
@@ -864,19 +945,45 @@
       stats <- df %>%
         group_by(shoe_id) %>%
         summarise(
-          n_races        = n(),
-          total_km       = round(sum(distance_total, na.rm = TRUE), 1),
-          avg_pace       = round(mean(pace_mean, na.rm = TRUE), 2),
-          best_pace      = round(min(pace_mean, na.rm = TRUE), 2),
-          worst_pace     = round(max(pace_mean, na.rm = TRUE), 2),
-          avg_distance   = round(mean(distance_total, na.rm = TRUE), 1),
-          min_distance   = round(min(distance_total, na.rm = TRUE), 1),
-          max_distance   = round(max(distance_total, na.rm = TRUE), 1),
-          first_used     = min(start_time, na.rm = TRUE),
-          last_used      = max(start_time, na.rm = TRUE),
-          .groups        = "drop"
+          n_races      = n(),
+          total_km     = round(sum(distance_total,  na.rm = TRUE), 1),
+          avg_pace     = round(mean(pace_mean,       na.rm = TRUE), 2),
+          best_pace    = round(min(pace_mean,        na.rm = TRUE), 2),
+          worst_pace   = round(max(pace_mean,        na.rm = TRUE), 2),
+          avg_distance = round(mean(distance_total,  na.rm = TRUE), 1),
+          min_distance = round(min(distance_total,   na.rm = TRUE), 1),
+          max_distance = round(max(distance_total,   na.rm = TRUE), 1),
+          first_used   = min(start_time, na.rm = TRUE),
+          last_used    = max(start_time, na.rm = TRUE),
+          .groups      = "drop"
         ) %>%
         arrange(desc(total_km))
+    }
+    
+    # Join friendly names and retired flag
+    {
+      names_path <- file.path(BASE_DIR, "shoe_names.csv")
+      if (file.exists(names_path)) {
+        shoe_names <- fread(names_path) %>%
+          as.data.frame() %>%
+          mutate(
+            shoe_id  = as.character(shoe_id),
+            retired  = as.logical(retired)
+          )
+        stats <- stats %>%
+          left_join(shoe_names, by = "shoe_id") %>%
+          mutate(
+            name    = case_when(
+              shoe_id == "Unassigned" ~ "Unassigned",
+              !is.na(name)            ~ name,
+              TRUE                    ~ paste0("Unknown (", substr(shoe_id, 1, 8), "...)")
+            ),
+            retired = ifelse(is.na(retired), FALSE, retired)
+          )
+      } else {
+        stats$name    <- ifelse(stats$shoe_id == "Unassigned", "Unassigned", stats$shoe_id)
+        stats$retired <- FALSE
+      }
     }
     
     # Add percentiles vs all runs
@@ -893,4 +1000,207 @@
     
     return(stats)
   }
+  
+  
+  
+}
+
+# ============================================================
+# ML MODELS
+# ============================================================
+{
+  # ---- ML: Compute live rolling features for a new race ------
+  # Uses the most recent races in ml_df and today() as reference
+  {
+    compute_prediction_features <- function(distance_km, terrain_cat,
+                                            ml_models, reference_date = today()) {
+      {
+        ml_df       <- ml_models$ml_df
+        terrain_lkp <- ml_models$terrain
+        feat_cols   <- ml_models$feats
+        
+        # Elevation from terrain lookup
+        terrain_row    <- terrain_lkp %>% filter(terrain == terrain_cat)
+        ascent_per_km  <- terrain_row$median_ascent_per_km[1]
+        descent_per_km <- terrain_row$median_descent_per_km[1]
+        net_elev_per_km <- ascent_per_km - descent_per_km
+      }
+      
+      # Rolling features — computed from races BEFORE reference_date
+      {
+        past <- ml_df %>%
+          filter(date < reference_date) %>%
+          arrange(date)
+        
+        n_past <- nrow(past)
+        
+        if (n_past < 3) {
+          stop("Not enough past races to compute rolling features (need at least 3).")
+        }
+        
+        # Race-count rolling
+        avg_pace_last3  <- mean(tail(past$pace_mean,  3))
+        avg_pace_last5  <- mean(tail(past$pace_mean,  5))
+        avg_pace_last10 <- mean(tail(past$pace_mean, 10))
+        avg_dist_last3  <- mean(tail(past$distance_total,  3))
+        avg_dist_last5  <- mean(tail(past$distance_total,  5))
+        km_last3        <- sum(tail(past$distance_total,   3))
+        km_last5        <- sum(tail(past$distance_total,   5))
+        km_last10       <- sum(tail(past$distance_total,  10))
+        
+        # Calendar rolling
+        km_last7d   <- sum(past$distance_total[past$date >= reference_date -  7])
+        km_last14d  <- sum(past$distance_total[past$date >= reference_date - 14])
+        km_last30d  <- sum(past$distance_total[past$date >= reference_date - 30])
+        
+        avg_pace_last7d  <- {
+          r <- past$pace_mean[past$date >= reference_date -  7]
+          if (length(r) == 0) avg_pace_last3 else mean(r)
+        }
+        avg_pace_last14d <- {
+          r <- past$pace_mean[past$date >= reference_date - 14]
+          if (length(r) == 0) avg_pace_last5 else mean(r)
+        }
+        
+        n_races_last7d  <- sum(past$date >= reference_date -  7)
+        n_races_last14d <- sum(past$date >= reference_date - 14)
+        days_since_last <- as.numeric(reference_date - max(past$date))
+        
+        # Temporal features for reference_date
+        hour_val    <- 8L   # default morning — user could expose this later
+        time_of_day <- factor("morning",
+                              levels = c("early_morning","morning","midday",
+                                         "afternoon","evening"))
+        month_num   <- lubridate::month(reference_date)
+        season      <- factor(
+          case_when(
+            month_num %in% c(12,1,2)    ~ "dry_cool",
+            month_num %in% c(3,4,5)     ~ "dry_hot",
+            month_num %in% c(6,7,8,9)   ~ "rainy",
+            TRUE                         ~ "transition"
+          ),
+          levels = c("dry_cool","dry_hot","rainy","transition")
+        )
+        weekday <- factor(
+          lubridate::wday(reference_date, label = TRUE, abbr = TRUE),
+          levels = levels(ml_df$weekday)
+        )
+      }
+      
+      # Assemble single-row data frame matching ml_df structure
+      {
+        new_row <- tibble(
+          distance_total   = distance_km,
+          ascent_per_km    = ascent_per_km,
+          descent_per_km   = descent_per_km,
+          net_elev_per_km  = net_elev_per_km,
+          time_of_day      = time_of_day,
+          season           = season,
+          weekday          = weekday,
+          avg_pace_last3   = avg_pace_last3,
+          avg_pace_last5   = avg_pace_last5,
+          avg_pace_last10  = avg_pace_last10,
+          avg_dist_last3   = avg_dist_last3,
+          avg_dist_last5   = avg_dist_last5,
+          km_last3         = km_last3,
+          km_last5         = km_last5,
+          km_last10        = km_last10,
+          km_last7d        = km_last7d,
+          km_last14d       = km_last14d,
+          km_last30d       = km_last30d,
+          avg_pace_last7d  = avg_pace_last7d,
+          avg_pace_last14d = avg_pace_last14d,
+          n_races_last7d   = n_races_last7d,
+          n_races_last14d  = n_races_last14d,
+          days_since_last  = days_since_last
+        )
+        
+        # One-hot encode to match ml_matrix column structure
+        new_mat <- model.matrix(~ . - 1, data = new_row %>%
+                                  mutate(across(c(time_of_day, season, weekday),
+                                                as.factor))) %>%
+          as.data.frame()
+        
+        # Align columns exactly with training matrix
+        train_cols <- colnames(ml_models$ml_mat)
+        missing_cols <- setdiff(train_cols, names(new_mat))
+        for (col in missing_cols) new_mat[[col]] <- 0
+        new_mat <- new_mat[, train_cols, drop = FALSE]
+      }
+      
+      list(
+        new_row    = new_row,
+        new_mat    = new_mat,
+        naive_last3 = avg_pace_last3,
+        naive_last7d = avg_pace_last7d
+      )
+    }
+  }
+  
+  # ---- ML: Generate predictions with confidence intervals ----
+  {
+    predict_pace <- function(distance_km, terrain_cat, ml_models,
+                             reference_date = today()) {
+      {
+        feats <- compute_prediction_features(distance_km, terrain_cat,
+                                             ml_models, reference_date)
+        
+        # CV residual SDs for CI — from ml_lab results (2024+ run)
+        # Using ±2.5 SD for ~95% coverage given fat tails in QQ plot
+        SD_XGB <- 0.198 / 1.96   # approx residual SD from CV RMSE
+        SD_LM  <- 0.218 / 1.96
+        SD_NAIVE <- 0.236 / 1.96
+        Z <- 2.5                  # wider than 1.96 given leptokurtosis
+      }
+      
+      # XGBoost prediction
+      {
+        dmat     <- xgb.DMatrix(as.matrix(feats$new_mat))
+        pred_xgb <- predict(ml_models$xgb, dmat)
+      }
+      
+      # Linear model prediction
+      {
+        pred_lm <- predict(ml_models$lm, newdata = feats$new_row)
+      }
+      
+      # Naive: avg of last 3 races
+      {
+        pred_naive <- feats$naive_last3
+      }
+      
+      # Build results table
+      {
+        results <- tibble(
+          model      = c("XGBoost", "Linear (pace)", "Naive last 3"),
+          pred_pace  = c(pred_xgb, pred_lm, pred_naive),
+          sd         = c(SD_XGB, SD_LM, SD_NAIVE),
+          ci_lo      = pred_pace - Z * sd,
+          ci_hi      = pred_pace + Z * sd,
+          total_time = pred_pace * distance_km
+        ) %>%
+          mutate(
+            pred_str    = sapply(pred_pace,  pace_dec_to_str),
+            ci_lo_str   = sapply(ci_lo,      pace_dec_to_str),
+            ci_hi_str   = sapply(ci_hi,      pace_dec_to_str),
+            total_str   = sapply(total_time, function(t) {
+              h <- floor(t / 60)
+              m <- floor(t %% 60)
+              s <- round((t %% 1) * 60)
+              if (h > 0) sprintf("%dh %02d'%02d\"", h, m, s)
+              else       sprintf("%02d'%02d\"", m, s)
+            })
+          )
+      }
+      
+      list(
+        results    = results,
+        feats      = feats$new_row,
+        distance   = distance_km,
+        terrain    = terrain_cat,
+        ref_date   = reference_date
+      )
+    }
+  }
+
 }
