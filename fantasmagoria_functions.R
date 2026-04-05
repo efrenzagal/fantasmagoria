@@ -13,6 +13,7 @@
   library(stringr)
   library(ggplot2)
   library(plotly)
+  library(httr2)
 }
 
 # ============================================================
@@ -190,13 +191,16 @@
   }
   
   # Extract km splits (moments) from a detail JSON
+  # Uses speed time-series to subtract pause time (traffic lights, shoe tying)
   extract_detail_splits <- function(activity_id) {
+    # Load moments and time-series data
     {
       result  <- load_detail(activity_id)
       moments <- result$moments
       if (is.null(moments) || !is.data.frame(moments) || nrow(moments) == 0) return(NULL)
     }
     
+    # Build splits with active-only pace (excluding pauses)
     {
       splits <- moments %>%
         filter(key == "split_km") %>%
@@ -208,17 +212,56 @@
         ) %>%
         arrange(km)
       
-      # Use run start time for km 1 so it doesn't get NA from lag()
       run_start <- as.POSIXct(result$start_epoch_ms / 1000,
                               origin = "1970-01-01", tz = "UTC") %>% with_tz(TZ)
       
-      splits <- splits %>%
-        mutate(
-          prev_time        = c(run_start, timestamp[-n()]),
-          split_duration_s = as.numeric(difftime(timestamp, prev_time, units = "secs")),
-          split_pace       = split_duration_s / 60
-        ) %>%
-        select(id, km, timestamp, split_duration_s, split_pace)
+      # Try to get speed time-series to detect pauses
+      ts <- tryCatch(extract_detail_timeseries(activity_id), error = function(e) NULL)
+      speed_ts <- NULL
+      if (!is.null(ts)) {
+        speed_ts <- ts %>%
+          filter(variable == "speed") %>%
+          arrange(start_epoch_ms) %>%
+          select(start_epoch_ms, end_epoch_ms, speed = value)
+      }
+      
+      splits$prev_time <- c(run_start, splits$timestamp[-nrow(splits)])
+      
+      if (!is.null(speed_ts) && nrow(speed_ts) > 2) {
+        # For each split, sum only the time segments where speed > 0
+        PAUSE_THRESHOLD <- 0.5  # m/s — below this counts as paused
+        active_durations <- numeric(nrow(splits))
+        
+        for (i in seq_len(nrow(splits))) {
+          split_start_ms <- as.numeric(splits$prev_time[i]) * 1000
+          split_end_ms   <- as.numeric(splits$timestamp[i]) * 1000
+          
+          segs <- speed_ts %>%
+            filter(start_epoch_ms >= split_start_ms,
+                   start_epoch_ms <= split_end_ms)
+          
+          if (nrow(segs) > 0) {
+            # Each segment duration where runner was moving
+            segs <- segs %>%
+              mutate(seg_duration = (end_epoch_ms - start_epoch_ms) / 1000) %>%
+              filter(speed >= PAUSE_THRESHOLD)
+            active_durations[i] <- sum(segs$seg_duration, na.rm = TRUE)
+          } else {
+            # Fallback to wall-clock time
+            active_durations[i] <- as.numeric(difftime(splits$timestamp[i],
+                                                       splits$prev_time[i], units = "secs"))
+          }
+        }
+        
+        splits$split_duration_s <- active_durations
+      } else {
+        # Fallback: use wall-clock time if no speed data
+        splits$split_duration_s <- as.numeric(difftime(splits$timestamp,
+                                                       splits$prev_time, units = "secs"))
+      }
+      
+      splits$split_pace <- splits$split_duration_s / 60
+      splits <- splits %>% select(id, km, timestamp, split_duration_s, split_pace)
     }
     
     return(splits)
@@ -302,6 +345,18 @@
     sprintf("%d'%02d", mins, secs)
   }
   
+  # Compute efficiency frontier: best pace at each distance level (Pareto optimal)
+  compute_efficiency_frontier <- function(df) {
+    {
+      frontier <- df %>%
+        arrange(distance_total) %>%
+        mutate(running_min_pace = cummin(pace_mean)) %>%
+        filter(pace_mean == running_min_pace) %>%
+        select(distance_total, pace_mean, score, start_time)
+    }
+    return(frontier)
+  }
+  
   find_similar_race <- function(distance, pace_dec, net_ascent_per_km, all_races_df, k = 1) {
     {
       train        <- all_races_df %>%
@@ -370,8 +425,11 @@
         ylab(y_label) +
         theme_fantasmagoria()
       
-      if (show_trend) {
-        p <- p + geom_smooth(se = FALSE, color = "#ff6b6b", linewidth = 1)
+      if (show_trend && nrow(plot_df) >= 4) {
+        loess_fit     <- loess(value ~ as.numeric(period), data = plot_df)
+        plot_df$trend <- predict(loess_fit)
+        p <- p + geom_line(data = plot_df, aes(x = period, y = trend),
+                           color = COL_TREND, linewidth = 1, inherit.aes = FALSE)
       }
     }
     
@@ -416,12 +474,13 @@
   }
   
   plot_pace_continuous <- function(activity_id, avg_pace = NULL) {
+    # Data preparation
     {
       ts <- extract_detail_timeseries(activity_id)
       if (is.null(ts)) {
-        return(ggplot() +
-                 labs(title = "No time-series data available") +
-                 theme_fantasmagoria())
+        return(plot_ly() %>%
+                 layout(title = "No time-series data available") %>%
+                 apply_dark_theme())
       }
       
       pace_ts <- ts %>% filter(variable == "pace") %>%
@@ -434,9 +493,9 @@
         select(start_epoch_ms, cum_distance)
       
       if (nrow(pace_ts) == 0 || nrow(dist_ts) == 0) {
-        return(ggplot() +
-                 labs(title = "No continuous pace data available") +
-                 theme_fantasmagoria())
+        return(plot_ly() %>%
+                 layout(title = "No continuous pace data available") %>%
+                 apply_dark_theme())
       }
       
       # Interpolate cumulative distance at each pace timestamp
@@ -461,30 +520,40 @@
                pace <= pace_mean_val + 3 * pace_sd_val)
     }
     
+    # Build plotly directly (avoids ggplotly converting geom_line to scatter)
     {
       if (nrow(combined) == 0) {
-        return(ggplot() +
-                 labs(title = "No continuous pace data available") +
-                 theme_fantasmagoria())
+        return(plot_ly() %>%
+                 layout(title = "No continuous pace data available") %>%
+                 apply_dark_theme())
       }
       
-      # Downsample to ~500 points max to avoid C stack overflow in ggplotly
+      # Downsample to ~500 points max for performance
       if (nrow(combined) > 500) {
         idx <- round(seq(1, nrow(combined), length.out = 500))
         combined <- combined[idx, ]
       }
       
-      p <- ggplot(combined, aes(x = cum_distance, y = pace,
-                                text = paste0("Km: ", round(cum_distance, 2),
-                                              "<br>Pace: ", sapply(pace, pace_dec_to_str)))) +
-        geom_line(color = "#00d4ff", linewidth = 0.8) +
-        xlab("Distance (km)") +
-        ylab("Pace (min/km)") +
-        theme_fantasmagoria()
+      combined$pace_str <- sapply(combined$pace, pace_dec_to_str)
+      
+      p <- plot_ly(combined, x = ~cum_distance, y = ~pace,
+                   type = "scatter", mode = "lines",
+                   line = list(color = COL_ACCENT, width = 2),
+                   hoverinfo = "text",
+                   text = ~paste0("Km: ", round(cum_distance, 2),
+                                  "<br>Pace: ", pace_str)) %>%
+        layout(xaxis = list(title = "Distance (km)"),
+               yaxis = list(title = "Pace (min/km)"))
       
       if (!is.null(avg_pace)) {
-        p <- p + geom_hline(yintercept = avg_pace, color = "#ff6b6b",
-                            linetype = "dashed", linewidth = 0.8)
+        p <- p %>% add_trace(
+          x = range(combined$cum_distance), y = c(avg_pace, avg_pace),
+          type = "scatter", mode = "lines",
+          line = list(color = COL_TREND, width = 2, dash = "dash"),
+          hoverinfo = "text",
+          text = paste0("Avg: ", pace_dec_to_str(avg_pace)),
+          showlegend = FALSE
+        )
       }
     }
     
@@ -560,6 +629,7 @@
   }
   
   get_gps_data <- function(activity_id) {
+    # Extract lat, lon, pace, and cumulative distance for enriched hover
     {
       ts <- extract_detail_timeseries(activity_id)
       if (is.null(ts)) return(NULL)
@@ -579,6 +649,248 @@
         )
     }
     
+    # Interpolate pace and cumulative distance at each GPS timestamp
+    {
+      pace_ts <- ts %>% filter(variable == "pace") %>%
+        arrange(start_epoch_ms) %>%
+        select(start_epoch_ms, value)
+      
+      dist_ts <- ts %>% filter(variable == "distance") %>%
+        arrange(start_epoch_ms) %>%
+        mutate(cum_distance = cumsum(value)) %>%
+        select(start_epoch_ms, cum_distance)
+      
+      if (nrow(pace_ts) > 1) {
+        pace_fn <- approxfun(pace_ts$start_epoch_ms, pace_ts$value,
+                             method = "linear", rule = 2)
+        gps$pace <- pace_fn(gps$start_epoch_ms)
+        gps$pace_str <- sapply(gps$pace, function(x) {
+          if (is.na(x) || x <= 0 || x > 20) return("--")
+          pace_dec_to_str(x)
+        })
+      } else {
+        gps$pace     <- NA_real_
+        gps$pace_str <- "--"
+      }
+      
+      if (nrow(dist_ts) > 1) {
+        dist_fn <- approxfun(dist_ts$start_epoch_ms, dist_ts$cum_distance,
+                             method = "linear", rule = 2)
+        gps$cum_distance <- dist_fn(gps$start_epoch_ms)
+      } else {
+        gps$cum_distance <- NA_real_
+      }
+    }
+    
     return(gps)
+  }
+}
+
+
+# ============================================================
+# NIKE API (for Update Data)
+# ============================================================
+{
+  # HTTP helper — makes authorized requests to Nike API
+  nike_api_get <- function(url, token) {
+    {
+      resp <- request(url) |>
+        req_headers(Authorization = paste("Bearer", token)) |>
+        req_error(is_error = \(r) FALSE) |>
+        req_perform()
+      
+      if (resp_status(resp) != 200) {
+        stop(paste("Nike API error:", resp_status(resp),
+                   "— grab a fresh token and try again."))
+      }
+      
+      resp |> resp_body_json(simplifyVector = TRUE)
+    }
+  }
+  
+  # Flatten nested metric summaries to wide format
+  flatten_activity_metrics <- function(df) {
+    {
+      if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) return(tibble())
+      if (!all(c("metric", "summary", "value") %in% names(df))) return(tibble())
+      
+      df |>
+        mutate(col = paste0(metric, "_", summary)) |>
+        select(col, value) |>
+        pivot_wider(names_from = col, values_from = value, values_fn = first)
+    }
+  }
+  
+  # Fetch new activities incrementally (only after last_known_id)
+  fetch_new_activities <- function(token, output_dir, existing_ids = character(0),
+                                   log_fn = message) {
+    {
+      dir.create(output_dir, showWarnings = FALSE)
+      all_new <- data.frame()
+      next_url <- paste0(
+        "https://api.nike.com/plus/v3/activities/before_id/v3/*",
+        "?limit=30&types=run,jogging&include_deleted=false"
+      )
+      page <- 1
+    }
+    
+    # Paginate until we hit already-known activities
+    {
+      repeat {
+        log_fn(paste0("Fetching page ", page, "..."))
+        data <- nike_api_get(next_url, token)
+        
+        activities <- data$activities
+        if (is.null(activities) || nrow(activities) == 0) break
+        
+        # Check which are genuinely new
+        new_acts <- activities %>% filter(!id %in% existing_ids)
+        if (nrow(new_acts) == 0) break
+        
+        all_new <- bind_rows(all_new, new_acts)
+        
+        # If some were already known, we've reached the overlap
+        if (nrow(new_acts) < nrow(activities)) break
+        
+        before_id <- data$paging$before_id
+        if (is.null(before_id) || before_id == "") break
+        
+        next_url <- paste0(
+          "https://api.nike.com/plus/v3/activities/before_id/v3/", before_id,
+          "?limit=30&types=run,jogging&include_deleted=false"
+        )
+        page <- page + 1
+        Sys.sleep(0.3)
+      }
+    }
+    
+    # Flatten and save
+    {
+      if (nrow(all_new) == 0) {
+        log_fn("No new activities found.")
+        return(invisible(NULL))
+      }
+      
+      log_fn(paste0("Found ", nrow(all_new), " new activities. Flattening metrics..."))
+      metrics_df <- bind_rows(lapply(all_new$summaries, flatten_activity_metrics))
+      
+      new_summary <- all_new |>
+        select(id, type, start_epoch_ms, end_epoch_ms, active_duration_ms, status) |>
+        bind_cols(metrics_df) |>
+        mutate(
+          start_time   = as.POSIXct(start_epoch_ms / 1000, origin = "1970-01-01", tz = "UTC"),
+          end_time     = as.POSIXct(end_epoch_ms   / 1000, origin = "1970-01-01", tz = "UTC"),
+          duration_min = active_duration_ms / 60000
+        )
+      
+      # Append to existing CSV
+      csv_path <- file.path(output_dir, "activity_summaries.csv")
+      if (file.exists(csv_path)) {
+        existing <- fread(csv_path) %>% as.data.frame()
+        combined <- bind_rows(existing, new_summary)
+      } else {
+        combined <- new_summary
+      }
+      write.csv(combined, csv_path, row.names = FALSE)
+      log_fn(paste0("Updated CSV: ", csv_path, " (", nrow(combined), " total)"))
+    }
+    
+    # Download detail JSONs for new activities
+    {
+      detail_dir <- file.path(output_dir, "activity_details")
+      dir.create(detail_dir, showWarnings = FALSE)
+      
+      for (i in seq_along(all_new$id)) {
+        aid      <- all_new$id[i]
+        out_file <- file.path(detail_dir, paste0(aid, ".json"))
+        if (file.exists(out_file)) next
+        
+        log_fn(paste0("  Downloading detail [", i, "/", length(all_new$id), "] ", aid))
+        tryCatch({
+          detail_url <- paste0("https://api.nike.com/sport/v3/me/activity/", aid, "?metrics=ALL")
+          detail     <- nike_api_get(detail_url, token)
+          write_json(detail, out_file, pretty = TRUE, auto_unbox = TRUE)
+        }, error = function(e) {
+          log_fn(paste0("    WARNING: failed for ", aid, ": ", e$message))
+        })
+        Sys.sleep(0.3)
+      }
+    }
+    
+    log_fn(paste0("Done! ", nrow(all_new), " new activities added."))
+    return(invisible(nrow(all_new)))
+  }
+}
+
+
+# ============================================================
+# SHOES ANALYSIS
+# ============================================================
+{
+  # Load shoe_id for all activities from detail JSONs
+  load_shoe_data <- function() {
+    {
+      json_files <- list.files(DETAIL_DIR, pattern = "\\.json$", full.names = TRUE)
+      if (length(json_files) == 0) return(data.frame(id = character(0), shoe_id = character(0)))
+    }
+    
+    {
+      shoe_list <- lapply(json_files, function(f) {
+        tryCatch({
+          result <- fromJSON(f, simplifyVector = TRUE)
+          tags   <- result$tags
+          data.frame(
+            id      = result$id %||% NA_character_,
+            shoe_id = tags[["shoe_id"]] %||% NA_character_,
+            stringsAsFactors = FALSE
+          )
+        }, error = function(e) NULL)
+      })
+      shoe_df <- bind_rows(shoe_list)
+    }
+    
+    return(shoe_df)
+  }
+  
+  # Compute shoe summary statistics
+  compute_shoe_stats <- function(summaries_df, shoe_df) {
+    {
+      df <- summaries_df %>%
+        left_join(shoe_df, by = "id") %>%
+        mutate(shoe_id = ifelse(is.na(shoe_id) | shoe_id == "", "Unassigned", shoe_id))
+    }
+    
+    {
+      stats <- df %>%
+        group_by(shoe_id) %>%
+        summarise(
+          n_races        = n(),
+          total_km       = round(sum(distance_total, na.rm = TRUE), 1),
+          avg_pace       = round(mean(pace_mean, na.rm = TRUE), 2),
+          best_pace      = round(min(pace_mean, na.rm = TRUE), 2),
+          worst_pace     = round(max(pace_mean, na.rm = TRUE), 2),
+          avg_distance   = round(mean(distance_total, na.rm = TRUE), 1),
+          min_distance   = round(min(distance_total, na.rm = TRUE), 1),
+          max_distance   = round(max(distance_total, na.rm = TRUE), 1),
+          first_used     = min(start_time, na.rm = TRUE),
+          last_used      = max(start_time, na.rm = TRUE),
+          .groups        = "drop"
+        ) %>%
+        arrange(desc(total_km))
+    }
+    
+    # Add percentiles vs all runs
+    {
+      all_dist_ecdf <- ecdf(summaries_df$distance_total)
+      all_pace_ecdf <- ecdf(summaries_df$pace_mean)
+      
+      stats <- stats %>%
+        mutate(
+          dist_pct = round(100 * all_dist_ecdf(avg_distance), 0),
+          pace_pct = round(100 * (1 - all_pace_ecdf(avg_pace)), 0)
+        )
+    }
+    
+    return(stats)
   }
 }
