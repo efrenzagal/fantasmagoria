@@ -65,7 +65,8 @@ ui <- {
         menuItem("Deep Dive",     tabName = "deep_dive", icon = icon("magnifying-glass")),
         menuItem("Shoes",         tabName = "shoes",     icon = icon("shoe-prints")),
         menuItem("ML Predictor",  tabName = "ml_pred",   icon = icon("robot")),  # <- ADD THIS
-        menuItem("Update Data",   tabName = "update",    icon = icon("rotate"))
+        menuItem("Update Data",   tabName = "update",    icon = icon("rotate")),
+        menuItem("Where Do I Run", tabName = "where", icon = icon("map"))
       )
     ),
     
@@ -74,39 +75,53 @@ ui <- {
       
       # Custom dark styling
       tags$head(tags$style(HTML("
-        body, .content-wrapper, .main-sidebar, .sidebar {
-          background-color: #1a1a1a !important;
-          color: #f0f0f0 !important;
-        }
-        .box {
-          background-color: #2b2b2b !important;
-          border-top-color: #444 !important;
-          color: #f0f0f0 !important;
-        }
-        .box-header {
-          background-color: #2b2b2b !important;
-          color: #f0f0f0 !important;
-        }
-        .box-title { color: #f0f0f0 !important; }
-        .skin-black .main-header .logo {
-          background-color: #111 !important;
-          color: #f0f0f0 !important;
-        }
-        .skin-black .main-header .navbar { background-color: #111 !important; }
-        .skin-black .main-sidebar         { background-color: #111 !important; }
-        label, .control-label, h4, p      { color: #f0f0f0 !important; }
-        .dataTables_wrapper, table.dataTable {
-          color: #f0f0f0 !important;
-          background-color: #2b2b2b !important;
-        }
-        table.dataTable thead th {
-          background-color: #333 !important;
-          color: #f0f0f0 !important;
-        }
-        .info-box { background-color: #2b2b2b !important; color: #f0f0f0 !important; }
-        .info-box-number, .info-box-text  { color: #f0f0f0 !important; }
-        .shiny-output-error               { color: #ff6b6b !important; }
-      "))),
+      body, .content-wrapper, .main-sidebar, .sidebar {
+        background-color: #1a1a1a !important;
+        color: #f0f0f0 !important;
+      }
+      .box {
+        background-color: #2b2b2b !important;
+        border-top-color: #444 !important;
+        color: #f0f0f0 !important;
+      }
+      .box-header {
+        background-color: #2b2b2b !important;
+        color: #f0f0f0 !important;
+      }
+      .box-title { color: #f0f0f0 !important; }
+      .skin-black .main-header .logo {
+        background-color: #111 !important;
+        color: #f0f0f0 !important;
+      }
+      .skin-black .main-header .navbar { background-color: #111 !important; }
+      .skin-black .main-sidebar         { background-color: #111 !important; }
+      label, .control-label, h4, p      { color: #f0f0f0 !important; }
+      .dataTables_wrapper, table.dataTable {
+        color: #f0f0f0 !important;
+        background-color: #2b2b2b !important;
+      }
+      table.dataTable thead th {
+        background-color: #333 !important;
+        color: #f0f0f0 !important;
+      }
+      .info-box { background-color: #2b2b2b !important; color: #f0f0f0 !important; }
+      .info-box-number, .info-box-text  { color: #f0f0f0 !important; }
+      .shiny-output-error               { color: #ff6b6b !important; }
+      
+      /* Leaflet legend dark theme */
+      .leaflet-control.info.legend {
+        background-color: #1a1a1a !important;
+        color: #f0f0f0 !important;
+        border: 1px solid #444 !important;
+        border-radius: 4px !important;
+      }
+      .leaflet-control.info.legend .legend-title {
+        color: #f0f0f0 !important;
+      }
+      .leaflet-control.info.legend i {
+        border-color: #444 !important;
+      }
+    "))),
       
       tabItems(
         
@@ -319,6 +334,27 @@ ui <- {
                   box(title = "Features used for this prediction",
                       width = 12, solidHeader = TRUE,
                       uiOutput("ml_feat_context")
+                  )
+                )
+        ),
+        # ====================================================
+        # TAB 7: WHERE DO I RUN
+        # ====================================================
+        tabItem(tabName = "where",
+                fluidRow(
+                  box(width = 12, solidHeader = TRUE,
+                      title = "Where Do I Run?",
+                      div(style = "display:flex; gap:20px; margin-bottom:10px; align-items:center;",
+                          radioButtons("where_color_by", label = "Color by:",
+                                       choices  = c("Visit intensity" = "visits",
+                                                    "Avg pace"        = "pace"),
+                                       selected = "visits",
+                                       inline   = TRUE),
+                          checkboxInput("where_show_zones",  "Show zones",       value = TRUE),
+                          checkboxInput("where_show_labels", "Show zone labels", value = TRUE),
+                          checkboxInput("where_show_bg",     "Show other cities", value = TRUE)
+                      ),
+                      leafletOutput("where_map", height = "550px")
                   )
                 )
         )
@@ -986,6 +1022,28 @@ server <- function(input, output, session) {
         stat_chip("Days since last",  paste0(round(f$days_since_last), " days"), "#aaa"),
         stat_chip("Terrain",          pred$terrain,                        "#ff6b6b"),
         stat_chip("Ascent/km",        paste0(round(f$ascent_per_km, 1), " m"), "#ff6b6b")
+      )
+    })
+  }
+  
+  # ---- WHERE DO I RUN --------------------------------------
+  {
+    where_map_data <- tryCatch(
+      load_where_map(),
+      error = function(e) {
+        message("Where map data could not be loaded: ", e$message)
+        NULL
+      }
+    )
+    
+    output$where_map <- renderLeaflet({
+      req(where_map_data)
+      render_where_map(
+        where_map_data,
+        color_by    = input$where_color_by,
+        show_zones  = input$where_show_zones,
+        show_labels = input$where_show_labels,
+        show_bg     = input$where_show_bg
       )
     })
   }

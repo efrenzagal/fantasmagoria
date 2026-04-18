@@ -269,7 +269,7 @@
                 PACE_CUTOFF, pace_dec_to_str(PACE_CUTOFF)))
     
     ml_df <- df %>%
-      select(id, start_time, date, all_of(TARGET_COL), all_of(FEATURE_COLS)) %>%
+      dplyr::select(id, start_time, date, all_of(TARGET_COL), all_of(FEATURE_COLS)) %>%
       filter(
         pace_mean <= PACE_CUTOFF,                  # remove outlier paces
         !is.na(avg_pace_last10),                   # rolling windows filled
@@ -303,7 +303,7 @@
     # Correlation of numeric features with target
     cat("  Pearson correlation with pace_mean (top 10):\n")
     num_cols <- ml_df %>%
-      select(where(is.numeric), -pace_mean) %>%
+      dplyr::select(where(is.numeric), -pace_mean) %>%
       names()
     cors <- sapply(num_cols, function(col) {
       cor(ml_df[[col]], ml_df$pace_mean, use = "complete.obs")
@@ -328,7 +328,31 @@ cat(sprintf("ml_df: %d rows, %d features, target range %.2f-%.2f min/km\n",
 # Never lets future data leak into training
 # ============================================================
 {
-  # ---- 3.1 Define folds --------------------------------------
+  # ---- 3.1 Align ml_df and ml_matrix -------------------------
+  {
+    cat_features <- c("time_of_day", "season", "weekday")
+    
+    # Drop any rows with NAs in feature cols and reset indices
+    ml_df <- ml_df[complete.cases(
+      ml_df %>% dplyr::select(all_of(FEATURE_COLS))
+    ), ]
+    row.names(ml_df) <- NULL
+    
+    # Rebuild ml_matrix from the cleaned ml_df
+    ml_matrix <- ml_df %>%
+      dplyr::select(all_of(FEATURE_COLS)) %>%
+      mutate(across(all_of(cat_features), as.factor)) %>%
+      model.matrix(~ . - 1, data = .) %>%
+      as.data.frame()
+    row.names(ml_matrix) <- NULL
+    
+    cat(sprintf("Model matrix: %d rows x %d columns (after one-hot encoding)\n",
+                nrow(ml_matrix), ncol(ml_matrix)))
+    cat(sprintf("ml_df rows: %d | ml_matrix rows: %d\n\n",
+                nrow(ml_df), nrow(ml_matrix)))
+  }
+  
+  # ---- 3.2 Define folds --------------------------------------
   {
     n         <- nrow(ml_df)
     # 3 folds: each adds ~17% more training data
@@ -357,7 +381,7 @@ cat(sprintf("ml_df: %d rows, %d features, target range %.2f-%.2f min/km\n",
     cat("\n")
   }
   
-  # ---- 3.2 Metric helpers ------------------------------------
+  # ---- 3.3 Metric helpers ------------------------------------
   {
     rmse <- function(actual, predicted) sqrt(mean((actual - predicted)^2, na.rm=TRUE))
     mae  <- function(actual, predicted) mean(abs(actual - predicted), na.rm=TRUE)
@@ -380,25 +404,8 @@ cat(sprintf("ml_df: %d rows, %d features, target range %.2f-%.2f min/km\n",
     }
     
     # Storage for all results
-    cv_results  <- list()
-    all_preds   <- list()   # for residual plots
-  }
-  
-  # ---- 3.3 Prepare model matrices ----------------------------
-  {
-    # One-hot encode factors for xgboost / neural net
-    # Keep original ml_df for R formula-based models
-    num_features <- FEATURE_COLS[!FEATURE_COLS %in% c("time_of_day", "season", "weekday")]
-    cat_features <- c("time_of_day", "season", "weekday")
-    
-    ml_matrix <- ml_df %>%
-      select(all_of(FEATURE_COLS)) %>%
-      mutate(across(all_of(cat_features), as.factor)) %>%
-      model.matrix(~ . - 1, data = .) %>%
-      as.data.frame()
-    
-    cat(sprintf("Model matrix: %d rows x %d columns (after one-hot encoding)\n\n",
-                nrow(ml_matrix), ncol(ml_matrix)))
+    cv_results <- list()
+    all_preds  <- list()
   }
 }
 
@@ -457,7 +464,7 @@ cat(sprintf("ml_df: %d rows, %d features, target range %.2f-%.2f min/km\n",
     # 5.1 Full linear model (all features)
     {
       lm_full <- lm(pace_mean ~ ., data = train_df %>%
-                      select(pace_mean, all_of(FEATURE_COLS)))
+                      dplyr::select(pace_mean, all_of(FEATURE_COLS)))
       pred_full <- predict(lm_full, newdata = val_df)
     }
     
@@ -472,7 +479,7 @@ cat(sprintf("ml_df: %d rows, %d features, target range %.2f-%.2f min/km\n",
       pace_only_features <- c("avg_pace_last3", "avg_pace_last7d",
                               "avg_pace_last14d", "avg_pace_last10")
       lm_pace <- lm(pace_mean ~ ., data = train_df %>%
-                      select(pace_mean, all_of(pace_only_features)))
+                      dplyr::select(pace_mean, all_of(pace_only_features)))
       pred_pace <- predict(lm_pace, newdata = val_df)
     }
     
@@ -493,7 +500,7 @@ cat(sprintf("ml_df: %d rows, %d features, target range %.2f-%.2f min/km\n",
   
   # Save final stepwise model (trained on all data) for inspection
   lm_final <- lm(pace_mean ~ ., data = ml_df %>%
-                   select(pace_mean, all_of(FEATURE_COLS)))
+                   dplyr::select(pace_mean, all_of(FEATURE_COLS)))
   lm_step_final <- stepAIC(lm_final, direction = "both", trace = FALSE)
   
   cat("\nStepwise AIC selected features:\n")

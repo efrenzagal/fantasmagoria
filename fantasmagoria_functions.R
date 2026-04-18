@@ -14,13 +14,24 @@
   library(ggplot2)
   library(plotly)
   library(httr2)
+  library(xgboost)
+  library(sf)
+  library(h3jsr)
+  library(leaflet)
+  library(leaflet.extras)
+  library(htmltools)
+  
+  # Resolve dplyr conflicts globally
+  select <- dplyr::select
+  slice  <- dplyr::slice
+  filter <- dplyr::filter
 }
 
 # ============================================================
 # CONFIG
 # ============================================================
 {
-  BASE_DIR   <- "~/Fantasmagoria 3.0/nike_data"
+  BASE_DIR   <- "~/fantasmagoria_clean/nike_data"
   DETAIL_DIR <- file.path(BASE_DIR, "activity_details")
   LAMBDA     <- -2   # Box-Cox lambda for pace transformation
   TZ         <- "America/Mexico_City"
@@ -33,6 +44,10 @@
   COL_ACCENT   <- "#00d4ff"   # cyan — dots, lines
   COL_TREND    <- "#ff6b6b"   # red — trend line / avg pace reference
   COL_ORANGE   <- "#ffaa00"   # orange — elevation
+  
+  # Pace scale for where map
+  PACE_MIN <- 3.0     # <-- add this
+  PACE_MAX <- 7.5     # <-- add this
 }
 
 
@@ -283,14 +298,15 @@
   }
   
   # Load ML models  
-  load_ml_models <- function() {
+  # Load ML models
+  load_ml_models <- function() 
+  {
     {
       model_dir <- BASE_DIR
       
       paths <- list(
         lm      = file.path(model_dir, "model_lm.rds"),
         xgb     = file.path(model_dir, "model_xgb.rds"),
-        ml_df   = file.path(model_dir, "ml_df.rds"),
         ml_mat  = file.path(model_dir, "ml_matrix.rds"),
         terrain = file.path(model_dir, "terrain_lookup.rds"),
         feats   = file.path(model_dir, "feature_cols.rds")
@@ -302,16 +318,24 @@
                 "\nRun ml_lab.R first to train and save models.")
         return(NULL)
       }
-      
-      list(
-        lm      = readRDS(paths$lm),
-        xgb     = readRDS(paths$xgb),
-        ml_df   = readRDS(paths$ml_df),
-        ml_mat  = readRDS(paths$ml_mat),
-        terrain = readRDS(paths$terrain),
-        feats   = readRDS(paths$feats)
-      )
     }
+    
+    # Rebuild ml_df live from CSV so new races are always included
+    {
+      ml_df <- load_summaries() %>%
+        arrange(start_time) %>%
+        filter(start_time > ymd('2024-01-01')) %>%
+        mutate(date = as.Date(start_time, tz = TZ))
+    }
+    
+    list(
+      lm      = readRDS(paths$lm),
+      xgb     = readRDS(paths$xgb),
+      ml_df   = ml_df,               # <-- live, not stale .rds
+      ml_mat  = readRDS(paths$ml_mat),
+      terrain = readRDS(paths$terrain),
+      feats   = readRDS(paths$feats)
+    )
   }
 }
 
@@ -1203,4 +1227,220 @@
     }
   }
 
+}
+
+# ============================================================
+# WHERE DO I RUN — MAP
+# ============================================================
+{
+  # Load precomputed hex and zone data
+  load_where_map <- function()
+  {
+    {
+      paths <- list(
+        hex_all = file.path(BASE_DIR, "hex_polys_all.rds"),
+        hex     = file.path(BASE_DIR, "hex_polys_sf.rds"),
+        zones   = file.path(BASE_DIR, "zone_polygons.rds")
+      )
+      missing <- names(paths)[!sapply(paths, file.exists)]
+      if (length(missing) > 0) {
+        warning("Where map files not found: ", paste(missing, collapse = ", "),
+                "\nRun where_do_i_run.R first.")
+        return(NULL)
+      }
+    }
+    
+    list(
+      hex_all = readRDS(paths$hex_all),
+      hex     = readRDS(paths$hex),
+      zones   = readRDS(paths$zones)
+    )
+  }
+  
+  # Render the full interactive leaflet map
+  render_where_map <- function(map_data,
+                               color_by    = "visits",
+                               show_zones  = TRUE,
+                               show_labels = TRUE,
+                               show_bg     = TRUE)
+  {
+    {
+      hex_all <- map_data$hex_all
+      hex     <- map_data$hex
+      zones   <- map_data$zones
+    }
+    
+    # Color palettes
+    {
+      pal_all <- colorNumeric(
+        palette  = c("#1a1a2e", "#0f3460", "#00d4ff"),
+        domain   = log1p(hex_all$n_points),
+        na.color = "transparent"
+      )
+      
+      pal <- if (color_by == "visits") {
+        colorNumeric(
+          palette  = c("#1a1a2e", "#16213e", "#0f3460", "#00d4ff", "#ffffff"),
+          domain   = log1p(hex$n_points),
+          na.color = "transparent"
+        )
+      } else {
+        colorNumeric(
+          palette  = c("#00cc44", "#ffaa00", "#ff4444"),
+          domain   = c(PACE_MIN, PACE_MAX),
+          na.color = "transparent"
+        )
+      }
+      fill_vals <- if (color_by == "visits") log1p(hex$n_points) else hex$avg_pace
+      
+      n_zones     <- nrow(zones)
+      base_colors <- c("#ff6b6b", "#ffaa00", "#00cc44", "#00d4ff",
+                       "#aa44ff", "#ff44aa", "#44ffaa", "#ffff44",
+                       "#ff8800", "#00ffcc", "#ff0088", "#88ff00",
+                       "#0088ff", "#ffcc00", "#cc00ff", "#00ff88")
+      zone_colors <- colorFactor(
+        palette = rep(base_colors, length.out = n_zones),
+        domain  = zones$zone_id
+      )
+    }
+    
+    # Hover labels
+    {
+      hex_all_labels <- sprintf(
+        "<b>Visits:</b> %d points, %d races<br><b>Avg pace:</b> %s min/km",
+        hex_all$n_points, hex_all$n_races,
+        sapply(hex_all$avg_pace, pace_dec_to_str)
+      ) %>% lapply(HTML)
+      
+      hex_labels <- sprintf(
+        "<b>Visits:</b> %d points, %d races<br><b>Avg pace:</b> %s min/km",
+        hex$n_points, hex$n_races,
+        sapply(hex$avg_pace, pace_dec_to_str)
+      ) %>% lapply(HTML)
+      
+      zone_labels <- sprintf(
+        "<b>%s</b><br>%d hexes | %d races<br>Avg pace: %s min/km",
+        zones$name, zones$n_hexes, zones$n_races,
+        sapply(zones$avg_pace, pace_dec_to_str)
+      ) %>% lapply(HTML)
+    }
+    
+    # Zone centroids for permanent labels
+    {
+      zone_centroids <- zones %>%
+        mutate(
+          centroid = st_centroid(geometry),
+          lon      = st_coordinates(centroid)[, 1],
+          lat      = st_coordinates(centroid)[, 2]
+        ) %>%
+        st_drop_geometry()
+    }
+    
+    # Legend title and values
+    {
+      legend_title  <- ifelse(color_by == "visits",
+                              "Visit intensity", "Avg pace (min/km)")
+      legend_format <- if (color_by == "visits")
+        labelFormat(transform = function(x) round(expm1(x)))
+      else
+        labelFormat()
+    }
+    
+    # Base map
+    {
+      m <- leaflet() %>%
+        addProviderTiles(providers$CartoDB.DarkMatter)
+    }
+    
+    # Conditionally add background layer
+    {
+      if (show_bg) {
+        m <- m %>%
+          addPolygons(
+            data        = hex_all,
+            fillColor   = ~pal_all(log1p(n_points)),
+            fillOpacity = 0.3,
+            color       = "transparent",
+            weight      = 0,
+            label       = hex_all_labels
+          )
+      }
+    }
+    
+    # Always add main hex layer
+    {
+      m <- m %>%
+        addPolygons(
+          data        = hex,
+          fillColor   = ~pal(fill_vals),
+          fillOpacity = 0.75,
+          color       = "transparent",
+          weight      = 0,
+          label       = hex_labels
+        )
+    }
+    
+    # Conditionally add zone outlines
+    {
+      if (show_zones) {
+        m <- m %>%
+          addPolygons(
+            data        = zones,
+            fillColor   = ~zone_colors(zone_id),
+            fillOpacity = 0.12,
+            color       = ~zone_colors(zone_id),
+            weight      = 2,
+            opacity     = 0.8,
+            dashArray   = "5,5",
+            label       = zone_labels
+          )
+      }
+    }
+    
+    # Conditionally add zone labels
+    {
+      if (show_labels) {
+        m <- m %>%
+          addCircleMarkers(
+            data         = zone_centroids,
+            lng          = ~lon,
+            lat          = ~lat,
+            radius       = 0,
+            stroke       = FALSE,
+            fillOpacity  = 0,
+            label        = ~name,
+            labelOptions = labelOptions(
+              noHide    = TRUE,
+              direction = "center",
+              textOnly  = TRUE,
+              style     = list(
+                "color"       = "white",
+                "font-weight" = "bold",
+                "font-size"   = "13px",
+                "text-shadow" = "1px 1px 3px black"
+              )
+            )
+          )
+      }
+    }
+    
+    # Add legend and zoom
+    {
+      m %>%
+        addLegend(
+          position  = "bottomright",
+          pal       = pal,
+          values    = fill_vals,
+          title     = legend_title,
+          opacity   = 0.8,
+          labFormat = legend_format
+        ) %>%
+        fitBounds(
+          lng1 = -99.255,
+          lat1 =  19.305,
+          lng2 = -99.055,
+          lat2 =  19.555
+        )
+    }
+  }
 }

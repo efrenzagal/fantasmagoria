@@ -13,7 +13,7 @@
   library(lubridate)
   library(purrr)
   
-  BASE_DIR   <- "~/Fantasmagoria 2.0/nike_data"
+  BASE_DIR   <- "~/fantasmagoria_clean/nike_data"
   DETAIL_DIR <- file.path(BASE_DIR, "activity_details")
   N_SAMPLE   <- 10   # number of detail JSONs to sample for detailed EDA
 }

@@ -23,7 +23,7 @@ library(tidyr)
 
 # ---- CONFIG ------------------------------------------------
 
-ACCESS_TOKEN <- ""          # paste your Bearer token here
+ACCESS_TOKEN <- "eyJhbGciOiJSUzI1NiIsImtpZCI6IjRiY2Q5ZDYzLWYxNTktNDg5YS1hZWE3LTAxNTg2Mzc5OThmYnNpZyJ9.eyJpYXQiOjE3NzY1MDUwMzYsImV4cCI6MTc3NjUwODYzNiwiaXNzIjoib2F1dGgyYWNjIiwianRpIjoiN2Q0NzUwNWEtZjZlZS00YzU1LTlkMWQtNGM3ZDJkNjg0MTBmIiwiYXVkIjoiY29tLm5pa2UuZGlnaXRhbCIsInNidCI6Im5pa2U6YXBwIiwidHJ1c3QiOjEwMCwibGF0IjoxNzc2NTA1MDM0LCJzY3AiOlsibmlrZS5kaWdpdGFsIl0sInN1YiI6ImNvbS5uaWtlLmNvbW1lcmNlLm5pa2Vkb3Rjb20ud2ViIiwicHJuIjoiMTQ3ODYxODYyMDIiLCJwcnQiOiJuaWtlOnBsdXMiLCJscnNjcCI6Im9wZW5pZCBuaWtlLmRpZ2l0YWwgcHJvZmlsZSBlbWFpbCBwaG9uZSBmbG93IGNvdW50cnkiLCJscmlzcyI6Imh0dHBzOi8vYWNjb3VudHMubmlrZS5jb20ifQ.iSGEdormrR0bvr1Pk3OT8u6Wyla5cRZ-ingfZZJY7HR5XP2lV7uU8UIEy7uAGcdUIs_5Nlif4hs03__LbrwfeTPw-UjAUlYtheo17J4Dm8ZVw8o4vAEs60XSG_AfjGzkEEMSpCrSw2ng8gH1uULG751a5h0igxyLg4T7vhH86CrKPYI3E50A-_Qt7rQ7sCmQDMgkzD1p2gH-PbE8H4fgKenkHYrJRz5TO6mKK4YfiGOmTaxWjuQihBJMwQUxSuZT1b74Nrhi9HKSS7O101IW5E7orlDaM4NhKVmq7Pr20CLJwjHdeTu2gRPuS0PEwhK3y90cXqtoauWRL24ZOIhOKw"          # paste your Bearer token here
 OUTPUT_DIR   <- "nike_data" # folder to save files
 
 # ---- SETUP -------------------------------------------------
