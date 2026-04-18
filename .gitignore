@@ -1,0 +1,27 @@
+# Nike data — raw & derived (regenerable)
+nike_data/activity_details/
+nike_data/activity_summaries.csv
+nike_data/activity_summaries.json
+nike_data/feat_means.rds
+nike_data/feat_sds.rds
+nike_data/feature_cols.rds
+nike_data/hex_polys_all.rds
+nike_data/hex_polys_sf.rds
+nike_data/hex_stats_all.rds
+nike_data/hex_stats.rds
+nike_data/ml_df.rds
+nike_data/ml_matrix.rds
+nike_data/model_lm.rds
+nike_data/model_rf.rds
+nike_data/model_xgb.rds
+nike_data/terrain_lookup.rds
+
+# R artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# OS
+.DS_Store
+Thumbs.db
